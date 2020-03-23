@@ -41,200 +41,212 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
  */
 public class DefaultEventLoopGroupProvider implements EventLoopGroupProvider {
 
-    protected static final InternalLogger logger = InternalLoggerFactory.getInstance(DefaultEventLoopGroupProvider.class);
+  protected static final InternalLogger logger = InternalLoggerFactory.getInstance(DefaultEventLoopGroupProvider.class);
+  private static final ThreadFactoryProvider DEFAULT_THREAD_FACTORY_PROVIDER =
+      name -> new DefaultThreadFactory(name, true);
+  private final Map<Class<? extends EventExecutorGroup>, EventExecutorGroup> eventLoopGroups = new ConcurrentHashMap<>(2);
+  private final Map<ExecutorService, Long> refCounter = new ConcurrentHashMap<>(2);
 
-    private final Map<Class<? extends EventExecutorGroup>, EventExecutorGroup> eventLoopGroups = new ConcurrentHashMap<>(2);
-    private final Map<ExecutorService, Long> refCounter = new ConcurrentHashMap<>(2);
+  private final int numberOfThreads;
 
-    private final int numberOfThreads;
+  private volatile boolean shutdownCalled = false;
 
-    private volatile boolean shutdownCalled = false;
+  /**
+   * Creates a new instance of {@link DefaultEventLoopGroupProvider}.
+   *
+   * @param numberOfThreads number of threads (pool size)
+   */
+  public DefaultEventLoopGroupProvider(int numberOfThreads) {
+    this.numberOfThreads = numberOfThreads;
+  }
 
-    /**
-     * Creates a new instance of {@link DefaultEventLoopGroupProvider}.
-     *
-     * @param numberOfThreads number of threads (pool size)
-     */
-    public DefaultEventLoopGroupProvider(int numberOfThreads) {
-        this.numberOfThreads = numberOfThreads;
+  @Override
+  public <T extends EventLoopGroup> T allocate(Class<T> type) {
+
+    synchronized (this) {
+      logger.debug("Allocating executor {}", type.getName());
+      return addReference(getOrCreate(type));
+    }
+  }
+
+  private <T extends ExecutorService> T addReference(T reference) {
+
+    synchronized (refCounter) {
+      long counter = 0;
+      if (refCounter.containsKey(reference)) {
+        counter = refCounter.get(reference);
+      }
+
+      logger.debug("Adding reference to {}, existing ref count {}", reference, counter);
+      counter++;
+      refCounter.put(reference, counter);
     }
 
-    @Override
-    public <T extends EventLoopGroup> T allocate(Class<T> type) {
+    return reference;
+  }
 
-        synchronized (this) {
-            logger.debug("Allocating executor {}", type.getName());
-            return addReference(getOrCreate(type));
-        }
+  private <T extends ExecutorService> T release(T reference) {
+
+    synchronized (refCounter) {
+      long counter = 0;
+      if (refCounter.containsKey(reference)) {
+        counter = refCounter.get(reference);
+      }
+
+      if (counter < 1) {
+        logger.debug("Attempting to release {} but ref count is {}", reference, counter);
+      }
+
+      counter--;
+      if (counter == 0) {
+        refCounter.remove(reference);
+      } else {
+        refCounter.put(reference, counter);
+      }
     }
 
-    private <T extends ExecutorService> T addReference(T reference) {
+    return reference;
+  }
 
-        synchronized (refCounter) {
-            long counter = 0;
-            if (refCounter.containsKey(reference)) {
-                counter = refCounter.get(reference);
-            }
+  @SuppressWarnings("unchecked")
+  private <T extends EventLoopGroup> T getOrCreate(Class<T> type) {
 
-            logger.debug("Adding reference to {}, existing ref count {}", reference, counter);
-            counter++;
-            refCounter.put(reference, counter);
-        }
-
-        return reference;
+    if (shutdownCalled) {
+      throw new IllegalStateException("Provider is shut down and can not longer provide resources");
     }
 
-    private <T extends ExecutorService> T release(T reference) {
-
-        synchronized (refCounter) {
-            long counter = 0;
-            if (refCounter.containsKey(reference)) {
-                counter = refCounter.get(reference);
-            }
-
-            if (counter < 1) {
-                logger.debug("Attempting to release {} but ref count is {}", reference, counter);
-            }
-
-            counter--;
-            if (counter == 0) {
-                refCounter.remove(reference);
-            } else {
-                refCounter.put(reference, counter);
-            }
-        }
-
-        return reference;
+    if (!eventLoopGroups.containsKey(type)) {
+      eventLoopGroups.put(type, createEventLoopGroup(type, numberOfThreads, getThreadFactoryProvider()));
     }
 
-    @SuppressWarnings("unchecked")
-    private <T extends EventLoopGroup> T getOrCreate(Class<T> type) {
+    return (T) eventLoopGroups.get(type);
+  }
 
-        if (shutdownCalled) {
-            throw new IllegalStateException("Provider is shut down and can not longer provide resources");
-        }
+  protected ThreadFactoryProvider getThreadFactoryProvider() {
+    return DEFAULT_THREAD_FACTORY_PROVIDER;
+  }
 
-        if (!eventLoopGroups.containsKey(type)) {
-            eventLoopGroups.put(type, createEventLoopGroup(type, numberOfThreads));
-        }
+  /**
+   * Create an instance of a {@link EventExecutorGroup}. Supported types are:
+   * <ul>
+   * <li>DefaultEventExecutorGroup</li>
+   * <li>NioEventLoopGroup</li>
+   * <li>EpollEventLoopGroup</li>
+   * <li>KQueueEventLoopGroup</li>
+   * </ul>
+   *
+   * @param type the type
+   * @param numberOfThreads the number of threads to use for the {@link EventExecutorGroup}
+   * @param <T> type parameter
+   * @return a new instance of a {@link EventExecutorGroup}
+   * @throws IllegalArgumentException if the {@code type} is not supported.
+   */
+  public static <T extends EventExecutorGroup> EventExecutorGroup createEventLoopGroup(Class<T> type, int numberOfThreads) {
+    return createEventLoopGroup(type, numberOfThreads, DEFAULT_THREAD_FACTORY_PROVIDER);
+  }
 
-        return (T) eventLoopGroups.get(type);
+  private static <T extends EventExecutorGroup> EventExecutorGroup createEventLoopGroup(Class<T> type,
+                                                                                        int numberOfThreads,
+                                                                                        ThreadFactoryProvider threadFactoryProvider) {
+
+    logger.debug("Creating executor {}", type.getName());
+
+    if (DefaultEventExecutorGroup.class.equals(type)) {
+      return new DefaultEventExecutorGroup(numberOfThreads, threadFactoryProvider.forName("lettuce-eventExecutorLoop"));
     }
 
-    /**
-     * Create an instance of a {@link EventExecutorGroup}. Supported types are:
-     * <ul>
-     * <li>DefaultEventExecutorGroup</li>
-     * <li>NioEventLoopGroup</li>
-     * <li>EpollEventLoopGroup</li>
-     * </ul>
-     *
-     * @param type the type
-     * @param numberOfThreads the number of threads to use for the {@link EventExecutorGroup}
-     * @param <T> type parameter
-     * @return a new instance of a {@link EventExecutorGroup}
-     * @throws IllegalArgumentException if the {@code type} is not supported.
-     */
-    public static <T extends EventExecutorGroup> EventExecutorGroup createEventLoopGroup(Class<T> type, int numberOfThreads) {
-
-        logger.debug("Creating executor {}", type.getName());
-
-        if (DefaultEventExecutorGroup.class.equals(type)) {
-            return new DefaultEventExecutorGroup(numberOfThreads, new DefaultThreadFactory("lettuce-eventExecutorLoop", true));
-        }
-
-        if (NioEventLoopGroup.class.equals(type)) {
-            return new NioEventLoopGroup(numberOfThreads, new DefaultThreadFactory("lettuce-nioEventLoop", true));
-        }
-
-        if (EpollProvider.isAvailable()) {
-
-            EventLoopResources resources = EpollProvider.getResources();
-
-            if (resources.matches(type)) {
-                return resources.newEventLoopGroup(numberOfThreads, new DefaultThreadFactory("lettuce-epollEventLoop", true));
-            }
-        }
-
-        if (KqueueProvider.isAvailable()) {
-
-            EventLoopResources resources = KqueueProvider.getResources();
-
-            if (resources.matches(type)) {
-                return resources.newEventLoopGroup(numberOfThreads, new DefaultThreadFactory("lettuce-kqueueEventLoop", true));
-            }
-        }
-
-        throw new IllegalArgumentException(String.format("Type %s not supported", type.getName()));
+    if (NioEventLoopGroup.class.equals(type)) {
+      return new NioEventLoopGroup(numberOfThreads, threadFactoryProvider.forName("lettuce-nioEventLoop"));
     }
 
-    @Override
-    public Promise<Boolean> release(EventExecutorGroup eventLoopGroup, long quietPeriod, long timeout, TimeUnit unit) {
+    if (EpollProvider.isAvailable()) {
 
-        logger.debug("Release executor {}", eventLoopGroup);
+      EventLoopResources resources = EpollProvider.getResources();
 
-        Class<?> key = getKey(release(eventLoopGroup));
-
-        if ((key == null && eventLoopGroup.isShuttingDown()) || refCounter.containsKey(eventLoopGroup)) {
-            DefaultPromise<Boolean> promise = new DefaultPromise<>(GlobalEventExecutor.INSTANCE);
-            promise.setSuccess(true);
-            return promise;
-        }
-
-        if (key != null) {
-            eventLoopGroups.remove(key);
-        }
-
-        Future<?> shutdownFuture = eventLoopGroup.shutdownGracefully(quietPeriod, timeout, unit);
-        return toBooleanPromise(shutdownFuture);
+      if (resources.matches(type)) {
+        return resources.newEventLoopGroup(numberOfThreads, threadFactoryProvider.forName("lettuce-epollEventLoop"));
+      }
     }
 
-    private Class<?> getKey(EventExecutorGroup eventLoopGroup) {
-        Class<?> key = null;
+    if (KqueueProvider.isAvailable()) {
 
-        Map<Class<? extends EventExecutorGroup>, EventExecutorGroup> copy = new HashMap<>(eventLoopGroups);
-        for (Map.Entry<Class<? extends EventExecutorGroup>, EventExecutorGroup> entry : copy.entrySet()) {
-            if (entry.getValue() == eventLoopGroup) {
-                key = entry.getKey();
-                break;
-            }
-        }
-        return key;
+      EventLoopResources resources = KqueueProvider.getResources();
+
+      if (resources.matches(type)) {
+        return resources.newEventLoopGroup(numberOfThreads, threadFactoryProvider.forName("lettuce-kqueueEventLoop"));
+      }
     }
 
-    @Override
-    public int threadPoolSize() {
-        return numberOfThreads;
+    throw new IllegalArgumentException(String.format("Type %s not supported", type.getName()));
+  }
+
+  @Override
+  public Promise<Boolean> release(EventExecutorGroup eventLoopGroup, long quietPeriod, long timeout, TimeUnit unit) {
+
+    logger.debug("Release executor {}", eventLoopGroup);
+
+    Class<?> key = getKey(release(eventLoopGroup));
+
+    if ((key == null && eventLoopGroup.isShuttingDown()) || refCounter.containsKey(eventLoopGroup)) {
+      DefaultPromise<Boolean> promise = new DefaultPromise<>(GlobalEventExecutor.INSTANCE);
+      promise.setSuccess(true);
+      return promise;
     }
 
-    @Override
-    @SuppressWarnings("unchecked")
-    public Future<Boolean> shutdown(long quietPeriod, long timeout, TimeUnit timeUnit) {
-
-        logger.debug("Initiate shutdown ({}, {}, {})", quietPeriod, timeout, timeUnit);
-
-        shutdownCalled = true;
-
-        List<EventExecutorGroup> copy = new ArrayList<>(eventLoopGroups.values());
-        DefaultPromise<Boolean> overall = new DefaultPromise<>(GlobalEventExecutor.INSTANCE);
-        CompletableFuture[] futures = new CompletableFuture[copy.size()];
-
-        for (int i = 0; i < copy.size(); i++) {
-
-            EventExecutorGroup executorGroup = copy.get(i);
-            futures[i] = Futures.toCompletionStage(release(executorGroup, quietPeriod, timeout, timeUnit))
-                    .toCompletableFuture();
-        }
-
-        CompletableFuture.allOf(futures).whenComplete((ignore, throwable) -> {
-
-            if (throwable != null) {
-                overall.setFailure(throwable);
-            } else {
-                overall.setSuccess(true);
-            }
-        });
-
-        return overall;
+    if (key != null) {
+      eventLoopGroups.remove(key);
     }
+
+    Future<?> shutdownFuture = eventLoopGroup.shutdownGracefully(quietPeriod, timeout, unit);
+    return toBooleanPromise(shutdownFuture);
+  }
+
+  private Class<?> getKey(EventExecutorGroup eventLoopGroup) {
+    Class<?> key = null;
+
+    Map<Class<? extends EventExecutorGroup>, EventExecutorGroup> copy = new HashMap<>(eventLoopGroups);
+    for (Map.Entry<Class<? extends EventExecutorGroup>, EventExecutorGroup> entry : copy.entrySet()) {
+      if (entry.getValue() == eventLoopGroup) {
+        key = entry.getKey();
+        break;
+      }
+    }
+    return key;
+  }
+
+  @Override
+  public int threadPoolSize() {
+    return numberOfThreads;
+  }
+
+  @Override
+  @SuppressWarnings("unchecked")
+  public Future<Boolean> shutdown(long quietPeriod, long timeout, TimeUnit timeUnit) {
+
+    logger.debug("Initiate shutdown ({}, {}, {})", quietPeriod, timeout, timeUnit);
+
+    shutdownCalled = true;
+
+    List<EventExecutorGroup> copy = new ArrayList<>(eventLoopGroups.values());
+    DefaultPromise<Boolean> overall = new DefaultPromise<>(GlobalEventExecutor.INSTANCE);
+    CompletableFuture[] futures = new CompletableFuture[copy.size()];
+
+    for (int i = 0; i < copy.size(); i++) {
+
+      EventExecutorGroup executorGroup = copy.get(i);
+      futures[i] = Futures.toCompletionStage(release(executorGroup, quietPeriod, timeout, timeUnit))
+          .toCompletableFuture();
+    }
+
+    CompletableFuture.allOf(futures).whenComplete((ignore, throwable) -> {
+
+      if (throwable != null) {
+        overall.setFailure(throwable);
+      } else {
+        overall.setSuccess(true);
+      }
+    });
+
+    return overall;
+  }
 }

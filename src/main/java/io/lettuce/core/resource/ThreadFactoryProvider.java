@@ -4,5 +4,5 @@ import java.util.concurrent.ThreadFactory;
 
 @FunctionalInterface
 public interface ThreadFactoryProvider {
-  ThreadFactory forName(String name);
+    ThreadFactory forName(String name);
 }
